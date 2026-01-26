@@ -123,6 +123,13 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// ResetPrice resets the current price (used when changing coins)
+func (s *Server) ResetPrice() {
+	s.mu.Lock()
+	s.currentPrice = 0
+	s.mu.Unlock()
+}
+
 // C++ wrapper functions for TUI access
 
 func GetMovingAverage() float64 {
@@ -135,4 +142,8 @@ func GetHigh() float64 {
 
 func GetLow() float64 {
 	return float64(C.get_low())
+}
+
+func ResetProcessor() {
+	C.reset_processor()
 }

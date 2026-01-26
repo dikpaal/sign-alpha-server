@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -20,11 +21,58 @@ type PriceUpdate struct {
 	Time  time.Time
 }
 
-// ConnectBinance connects to Binance WebSocket and streams prices for the given symbol
-func ConnectBinance(symbol string, priceChan chan<- PriceUpdate) {
-	url := "wss://stream.binance.com:9443/ws/" + symbol + "@trade"
+// BinanceClient manages the Binance WebSocket connection
+type BinanceClient struct {
+	mu        sync.RWMutex
+	symbol    string
+	conn      *websocket.Conn
+	priceChan chan<- PriceUpdate
+	restart   chan struct{}
+}
 
+// NewBinanceClient creates a new Binance client
+func NewBinanceClient(symbol string, priceChan chan<- PriceUpdate) *BinanceClient {
+	return &BinanceClient{
+		symbol:    symbol,
+		priceChan: priceChan,
+		restart:   make(chan struct{}, 1),
+	}
+}
+
+// GetSymbol returns the current symbol
+func (b *BinanceClient) GetSymbol() string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.symbol
+}
+
+// ChangeSymbol changes the trading pair and reconnects
+func (b *BinanceClient) ChangeSymbol(newSymbol string) {
+	b.mu.Lock()
+	b.symbol = newSymbol
+	if b.conn != nil {
+		b.conn.Close()
+	}
+	b.mu.Unlock()
+
+	// Signal restart
+	select {
+	case b.restart <- struct{}{}:
+	default:
+	}
+
+	log.Printf("Switching to %s", newSymbol)
+}
+
+// Run starts the Binance WebSocket connection loop
+func (b *BinanceClient) Run() {
 	for {
+		b.mu.RLock()
+		symbol := b.symbol
+		b.mu.RUnlock()
+
+		url := "wss://stream.binance.com:9443/ws/" + symbol + "@trade"
+
 		conn, _, err := websocket.DefaultDialer.Dial(url, nil)
 		if err != nil {
 			log.Printf("Binance connection error: %v, retrying in 5s...", err)
@@ -32,21 +80,30 @@ func ConnectBinance(symbol string, priceChan chan<- PriceUpdate) {
 			continue
 		}
 
-		log.Println("Connected to Binance WebSocket")
-		readBinanceMessages(conn, priceChan)
+		b.mu.Lock()
+		b.conn = conn
+		b.mu.Unlock()
+
+		log.Printf("Connected to Binance WebSocket for %s", symbol)
+		b.readMessages(conn)
 		conn.Close()
 
-		log.Println("Binance connection lost, reconnecting...")
-		time.Sleep(2 * time.Second)
+		// Check if we're restarting for symbol change
+		select {
+		case <-b.restart:
+			log.Println("Reconnecting with new symbol...")
+		default:
+			log.Println("Connection lost, reconnecting...")
+			time.Sleep(2 * time.Second)
+		}
 	}
 }
 
-// readBinanceMessages reads messages from Binance and sends price updates
-func readBinanceMessages(conn *websocket.Conn, priceChan chan<- PriceUpdate) {
+// readMessages reads messages from Binance WebSocket
+func (b *BinanceClient) readMessages(conn *websocket.Conn) {
 	for {
 		_, message, err := conn.ReadMessage()
 		if err != nil {
-			log.Printf("Read error: %v", err)
 			return
 		}
 
@@ -62,7 +119,7 @@ func readBinanceMessages(conn *websocket.Conn, priceChan chan<- PriceUpdate) {
 		}
 
 		if price > 0 {
-			priceChan <- PriceUpdate{
+			b.priceChan <- PriceUpdate{
 				Price: price,
 				Time:  time.UnixMilli(trade.Time),
 			}

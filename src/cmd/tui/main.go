@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -47,6 +48,13 @@ var (
 
 	errorStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("9"))
+
+	selectedStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("10")).
+			Bold(true)
+
+	itemStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("8"))
 )
 
 // API response types
@@ -61,6 +69,11 @@ type StatsResponse struct {
 }
 
 type SymbolResponse struct {
+	Symbol string `json:"symbol"`
+	Name   string `json:"name"`
+}
+
+type CoinInfo struct {
 	Symbol string `json:"symbol"`
 	Name   string `json:"name"`
 }
@@ -80,19 +93,34 @@ type DashboardData struct {
 	Error         string
 }
 
+// View modes
+type viewMode int
+
+const (
+	dashboardView viewMode = iota
+	coinSelectView
+)
+
 // Messages
 type tickMsg time.Time
 type dataMsg DashboardData
+type coinsMsg []CoinInfo
+type symbolChangedMsg struct{}
 
 // Model
 type model struct {
-	data     DashboardData
-	history  []float64
-	quitting bool
+	mode        viewMode
+	data        DashboardData
+	history     []float64
+	quitting    bool
+	coins       []CoinInfo
+	coinCursor  int
+	switching   bool
 }
 
 func initialModel() model {
 	return model{
+		mode:    dashboardView,
 		history: make([]float64, 0, 20),
 	}
 }
@@ -158,23 +186,87 @@ func fetchData() tea.Cmd {
 	}
 }
 
+func fetchCoins() tea.Cmd {
+	return func() tea.Msg {
+		resp, err := http.Get(serverURL + "/api/coins")
+		if err != nil {
+			return coinsMsg(nil)
+		}
+		defer resp.Body.Close()
+
+		var coins []CoinInfo
+		json.NewDecoder(resp.Body).Decode(&coins)
+		return coinsMsg(coins)
+	}
+}
+
+func changeSymbol(symbol string) tea.Cmd {
+	return func() tea.Msg {
+		body, _ := json.Marshal(map[string]string{"symbol": symbol})
+		resp, err := http.Post(serverURL+"/api/symbol", "application/json", bytes.NewReader(body))
+		if err != nil {
+			return nil
+		}
+		resp.Body.Close()
+		return symbolChangedMsg{}
+	}
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		switch msg.String() {
-		case "ctrl+c", "q":
-			m.quitting = true
-			return m, tea.Quit
+		switch m.mode {
+		case dashboardView:
+			switch msg.String() {
+			case "ctrl+c", "q":
+				m.quitting = true
+				return m, tea.Quit
+			case "c":
+				// Switch to coin selection
+				m.mode = coinSelectView
+				m.coinCursor = 0
+				return m, fetchCoins()
+			}
+
+		case coinSelectView:
+			switch msg.String() {
+			case "ctrl+c", "q", "esc":
+				// Go back to dashboard
+				m.mode = dashboardView
+				return m, nil
+			case "up", "k":
+				if m.coinCursor > 0 {
+					m.coinCursor--
+				}
+			case "down", "j":
+				if m.coinCursor < len(m.coins)-1 {
+					m.coinCursor++
+				}
+			case "enter", " ":
+				if len(m.coins) > 0 {
+					m.switching = true
+					selectedCoin := m.coins[m.coinCursor]
+					return m, changeSymbol(selectedCoin.Symbol)
+				}
+			}
 		}
 
 	case tickMsg:
-		return m, tea.Batch(fetchData(), tick())
+		if m.mode == dashboardView && !m.switching {
+			return m, tea.Batch(fetchData(), tick())
+		}
+		return m, tick()
 
 	case dataMsg:
 		newData := DashboardData(msg)
 
+		// Check if symbol changed (reset history)
+		if m.data.Symbol != "" && m.data.Symbol != newData.Symbol {
+			m.history = make([]float64, 0, 20)
+		}
+
 		// Calculate change
-		if m.data.Price > 0 && newData.Price > 0 {
+		if m.data.Price > 0 && newData.Price > 0 && m.data.Symbol == newData.Symbol {
 			newData.Change = newData.Price - m.data.Price
 			newData.ChangePercent = (newData.Change / m.data.Price) * 100
 		}
@@ -190,6 +282,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, nil
+
+	case coinsMsg:
+		m.coins = msg
+		// Find current coin and set cursor
+		for i, coin := range m.coins {
+			if coin.Symbol == m.data.Symbol {
+				m.coinCursor = i
+				break
+			}
+		}
+		return m, nil
+
+	case symbolChangedMsg:
+		m.switching = false
+		m.mode = dashboardView
+		m.history = make([]float64, 0, 20)
+		return m, fetchData()
 	}
 
 	return m, nil
@@ -200,6 +309,42 @@ func (m model) View() string {
 		return "Goodbye!\n"
 	}
 
+	switch m.mode {
+	case coinSelectView:
+		return m.viewCoinSelect()
+	default:
+		return m.viewDashboard()
+	}
+}
+
+func (m model) viewCoinSelect() string {
+	s := headerStyle.Render("Select Cryptocurrency") + "\n\n"
+
+	if len(m.coins) == 0 {
+		s += labelStyle.Render("Loading coins...")
+	} else {
+		for i, coin := range m.coins {
+			cursor := "  "
+			style := itemStyle
+			if i == m.coinCursor {
+				cursor = "▸ "
+				style = selectedStyle
+			}
+			// Mark current coin
+			current := ""
+			if coin.Symbol == m.data.Symbol {
+				current = " (current)"
+			}
+			s += style.Render(fmt.Sprintf("%s%s%s", cursor, coin.Name, current)) + "\n"
+		}
+	}
+
+	s += helpStyle.Render("\n↑/↓: navigate • enter: select • esc: cancel")
+
+	return boxStyle.Render(s)
+}
+
+func (m model) viewDashboard() string {
 	// Error state
 	if m.data.Error != "" {
 		content := fmt.Sprintf(
@@ -218,6 +363,17 @@ func (m model) View() string {
 			headerStyle.Render("◆ Trading Pipeline Dashboard"),
 			labelStyle.Render("Connecting to server..."),
 			helpStyle.Render("Press 'q' to quit"),
+		)
+		return boxStyle.Render(content)
+	}
+
+	// Switching indicator
+	if m.switching {
+		content := fmt.Sprintf(
+			"%s\n\n%s\n\n%s",
+			headerStyle.Render("◆ Trading Pipeline Dashboard"),
+			labelStyle.Render("Switching coin..."),
+			helpStyle.Render("Please wait..."),
 		)
 		return boxStyle.Render(content)
 	}
@@ -271,7 +427,7 @@ func (m model) View() string {
 		stats,
 		labelStyle.Render("Price History: "),
 		sparkline,
-		helpStyle.Render("Press 'q' to quit"),
+		helpStyle.Render("'c': change coin • 'q': quit"),
 	)
 
 	return boxStyle.Render(content)
