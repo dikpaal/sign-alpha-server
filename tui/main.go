@@ -55,6 +55,9 @@ var (
 
 	itemStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("8"))
+
+	timeStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("6"))
 )
 
 // API response types
@@ -78,6 +81,12 @@ type CoinInfo struct {
 	Name   string `json:"name"`
 }
 
+type HistoryTrade struct {
+	Symbol    string    `json:"symbol"`
+	Price     float64   `json:"price"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
 // Dashboard data
 type DashboardData struct {
 	Symbol        string
@@ -99,6 +108,7 @@ type viewMode int
 const (
 	dashboardView viewMode = iota
 	coinSelectView
+	historyView
 )
 
 // Messages
@@ -106,16 +116,19 @@ type tickMsg time.Time
 type dataMsg DashboardData
 type coinsMsg []CoinInfo
 type symbolChangedMsg struct{}
+type historyMsg []HistoryTrade
 
 // Model
 type model struct {
-	mode        viewMode
-	data        DashboardData
-	history     []float64
-	quitting    bool
-	coins       []CoinInfo
-	coinCursor  int
-	switching   bool
+	mode         viewMode
+	data         DashboardData
+	history      []float64
+	dbHistory    []HistoryTrade
+	quitting     bool
+	coins        []CoinInfo
+	coinCursor   int
+	switching    bool
+	historyScroll int
 }
 
 func initialModel() model {
@@ -200,6 +213,20 @@ func fetchCoins() tea.Cmd {
 	}
 }
 
+func fetchHistory() tea.Cmd {
+	return func() tea.Msg {
+		resp, err := http.Get(serverURL + "/api/history")
+		if err != nil {
+			return historyMsg(nil)
+		}
+		defer resp.Body.Close()
+
+		var trades []HistoryTrade
+		json.NewDecoder(resp.Body).Decode(&trades)
+		return historyMsg(trades)
+	}
+}
+
 func changeSymbol(symbol string) tea.Cmd {
 	return func() tea.Msg {
 		body, _ := json.Marshal(map[string]string{"symbol": symbol})
@@ -226,6 +253,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.mode = coinSelectView
 				m.coinCursor = 0
 				return m, fetchCoins()
+			case "h":
+				// Switch to history view
+				m.mode = historyView
+				m.historyScroll = 0
+				return m, fetchHistory()
 			}
 
 		case coinSelectView:
@@ -248,6 +280,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					selectedCoin := m.coins[m.coinCursor]
 					return m, changeSymbol(selectedCoin.Symbol)
 				}
+			}
+
+		case historyView:
+			switch msg.String() {
+			case "ctrl+c", "q", "esc":
+				// Go back to dashboard
+				m.mode = dashboardView
+				return m, tea.Batch(fetchData(), tick())
+			case "up", "k":
+				if m.historyScroll > 0 {
+					m.historyScroll--
+				}
+			case "down", "j":
+				maxScroll := len(m.dbHistory) - 15
+				if maxScroll < 0 {
+					maxScroll = 0
+				}
+				if m.historyScroll < maxScroll {
+					m.historyScroll++
+				}
+			case "r":
+				// Refresh history
+				return m, fetchHistory()
 			}
 		}
 
@@ -294,6 +349,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case historyMsg:
+		m.dbHistory = msg
+		return m, nil
+
 	case symbolChangedMsg:
 		m.switching = false
 		m.mode = dashboardView
@@ -312,6 +371,8 @@ func (m model) View() string {
 	switch m.mode {
 	case coinSelectView:
 		return m.viewCoinSelect()
+	case historyView:
+		return m.viewHistory()
 	default:
 		return m.viewDashboard()
 	}
@@ -340,6 +401,54 @@ func (m model) viewCoinSelect() string {
 	}
 
 	s += helpStyle.Render("\n↑/↓: navigate • enter: select • esc: cancel")
+
+	return boxStyle.Render(s)
+}
+
+func (m model) viewHistory() string {
+	coinName := m.data.CoinName
+	if coinName == "" {
+		coinName = "Crypto"
+	}
+
+	s := headerStyle.Render(fmt.Sprintf("◆ %s Trade History (from TimescaleDB)", coinName)) + "\n\n"
+
+	if len(m.dbHistory) == 0 {
+		s += labelStyle.Render("Loading history...")
+	} else {
+		// Show header
+		s += fmt.Sprintf("%s  %s  %s\n",
+			labelStyle.Render("Time"),
+			labelStyle.Render("          Price"),
+			labelStyle.Render("Symbol"))
+		s += labelStyle.Render("─────────────────────────────────────────") + "\n"
+
+		// Show trades with scrolling (15 visible)
+		endIdx := m.historyScroll + 15
+		if endIdx > len(m.dbHistory) {
+			endIdx = len(m.dbHistory)
+		}
+
+		for i := m.historyScroll; i < endIdx; i++ {
+			trade := m.dbHistory[i]
+			timeStr := trade.Timestamp.Local().Format("15:04:05")
+			priceStr := fmt.Sprintf("$%.2f", trade.Price)
+			if trade.Price < 1 {
+				priceStr = fmt.Sprintf("$%.6f", trade.Price)
+			}
+
+			s += fmt.Sprintf("%s  %s  %s\n",
+				timeStyle.Render(timeStr),
+				valueStyle.Render(fmt.Sprintf("%14s", priceStr)),
+				labelStyle.Render(trade.Symbol))
+		}
+
+		s += labelStyle.Render("─────────────────────────────────────────") + "\n"
+		s += labelStyle.Render(fmt.Sprintf("Showing %d-%d of %d trades",
+			m.historyScroll+1, endIdx, len(m.dbHistory)))
+	}
+
+	s += helpStyle.Render("\n↑/↓: scroll • r: refresh • esc: back to dashboard")
 
 	return boxStyle.Render(s)
 }
@@ -427,7 +536,7 @@ func (m model) viewDashboard() string {
 		stats,
 		labelStyle.Render("Price History: "),
 		sparkline,
-		helpStyle.Render("'c': change coin • 'q': quit"),
+		helpStyle.Render("'c': change coin • 'h': view DB history • 'q': quit"),
 	)
 
 	return boxStyle.Render(content)
